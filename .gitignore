@@ -1,2 +1,5 @@
 *.class
 *.log
+*.gitignore
+project\*
+target\*
