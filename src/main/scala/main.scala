@@ -1,26 +1,36 @@
 import java.io._
-import LogDataProject._
-import org.apache.spark.sql.functions
-import scala.collection.mutable._
+import scala.collection.immutable._
 import io.circe.generic.auto._, io.circe.syntax._
+import io.circe.{ Encoder, Json }
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.functions._
+  
+case class AccessLog(
+      ip: String, 
+      ident: String, 
+      user: String, 
+      datetime: String, 
+      request: String, 
+      status: String, 
+      size: String, 
+      referer: String, 
+      userAgent: String, 
+      unk: String
+)
+case class countReport(
+      access: Map[String, Long]
+)
 
 object report {
 
-  /** Case class use as an instance matching for our json report
-    *
-    * @param date a date
-    * @param countByIP an Json object from circe library. Encapsulate an iternal
-    * json representation of a scala Map[String, Long] data structure (key: ip
-    * address, value: count)
-    * @param countByURI an Json object from circe library. Encapsulate an iternal
-    * json representation of a scala Map[String, Long] data structure (key:
-    * uri, value: count)
-    */
-  case class jsonReport(
-      val date: String,
-      val countByIP: io.circe.Json,
-      val countByURI: io.circe.Json
-  )
+  val spark: SparkSession = SparkSession.builder()
+    .master("local[1]")
+    .appName("scalaSparkProject.com")
+    .getOrCreate()
+
+  import spark.implicits._
+
 
   /** Function defined to create a report from the logs data. the function
     * find all the dates having too big number of connection (> 20000) and for
@@ -36,20 +46,7 @@ object report {
       gzPath: String,
       outputPath: String
   ): Unit = {
-    val logs = spark.read.text(gzPath)
-
-    case class AccessLog(
-      ip: String, 
-      ident: String, 
-      user: String, 
-      datetime: String, 
-      request: String, 
-      status: String, 
-      size: String, 
-      referer: String, 
-      userAgent: String, 
-      unk: String
-    )
+    val logs = spark.read.text(gzPath)    
 
     val R = """^(?<ip>[0-9.]+) (?<identd>[^ ]) (?<user>[^ ]) \[(?<datetime>[^\]]+)\] \"(?<request>[^\"]*)\" (?<status>[^ ]*) (?<size>[^ ]*) \"(?<referer>[^\"]*)\" \"(?<useragent>[^\"]*)\" \"(?<unk>[^\"]*)\"""".r
 
@@ -85,7 +82,7 @@ object report {
 
 
     val sql = """select count(*) as count, cast(datetime as date) as date from AccessDataExt group by date  HAVING count(*) > 20000 order by count desc"""
-    def findDatesHavingMoreThan20kConnections: Seq[java.sql.Date] = spark.sql(sql).select("date").map(_.getDate(0)).collect()
+    def findDatesHavingMoreThan20kConnections: Array[java.sql.Date] = spark.sql(sql).select("date").map(_.getDate(0)).collect()
     val theDates = findDatesHavingMoreThan20kConnections
     val currentDate = theDates(0)
 
@@ -94,24 +91,27 @@ object report {
     .sql("select uri, cast(datetime as date) as date, count(*) as countaccess from AccessDataExt group by date, uri order by countaccess desc")
     .filter(col("date")===currentDate).drop("date")
 
-    case class UriReport(access: Map[String, Long])
+    def numberOfAccessByIp(currentDate: java.sql.Date) = spark
+    .sql("select ip, cast(datetime as date) as date, count(*) as countaccess from AccessDataExt group by date, ip order by countaccess desc")
+    .filter(col("date")===currentDate).drop("date")
 
-    def reportByDate(currentDate: java.sql.Date) = UriReport(numberOfAccessByUri(currentDate)
+    def reportUriByDate(currentDate: java.sql.Date) = countReport(numberOfAccessByUri(currentDate)
+    .collect
+    .map(r => (r.getString(0), r.getLong(1))).toMap)
+
+    def reportIpByDate(currentDate: java.sql.Date) = countReport(numberOfAccessByIp(currentDate)
     .collect
     .map(r => (r.getString(0), r.getLong(1))).toMap)
 
 
-    val reportAsSeq = theDates.map(date => (date,reportByDate(date)))
-    reportAsSeq.toDF("date", "uriReport")
-    .coalesce(1)
-    .write
-    .mode("Overwrite")
-    .json(outputPath)
+    import scala.util.parsing.json.JSONObject
+    val reportAsSeq = theDates.map(date => (date.toString(),reportUriByDate(date),reportIpByDate(date)))
+    val reportJson = reportAsSeq.asJson.noSpaces.toString()
 
     // write to the file and close it
-    /*val file = new PrintWriter(new File(outputPath))
-    file.write(myjsonreport + "\n")
-    file.close()*/
+    val file = new PrintWriter(new File(outputPath))
+    file.write(reportJson + "\n")
+    file.close()
     
   }
 
